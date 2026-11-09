@@ -57,10 +57,13 @@ With a free Apple account, the app stops opening after 7 days and needs installi
 1. On the PC, double-click `pc/start_receiver.bat`. It shows the PC address and a pairing code. Allow it through Windows Firewall on your private network if asked.
 2. In the app, tap **PC** and enter both. The phone and PC must be on the same Wi-Fi.
 3. Hold the iPhone sideways, with the buttons as the app shows them. Move it slowly until tracking starts.
-4. Tap a surface to place a model. Drag, pinch or twist to adjust it.
-5. Press record, film, then press stop.
-6. Tap **Send to PC**. The `.blend` file appears in `Documents\Trackshot`, with its video in a `_files` folder beside it. Keep them together.
-7. Open the `.blend` file in Blender and render.
+4. Tap **Scan light**. Stay in one spot and turn slowly, looking up, down and all around, until the map fills in. Then tap **Finish scan**. The picture flickers darker while it scans, which is normal.
+5. Tap a surface to place a model. Drag, pinch or twist to adjust it.
+6. Press record, film, then press stop.
+7. Tap **Send to PC**. The `.blend` file appears in `Documents\Trackshot`, with its video and HDRI in a `_files` folder beside it. Keep them together.
+8. Open the `.blend` file in Blender and render.
+
+Restarting the app clears the light scan, so scan again for a new session. The same scan is used for every take until then, so rescan if the lighting changes or you move to another room.
 
 **Without Wi-Fi:** tap **Share** to save the zip somewhere like iCloud Drive, then copy it to your PC and do one of these:
 
@@ -78,7 +81,7 @@ blender --background --python pc/trackshot_blender.py -- build capture.zip out.b
 | **Camera** | Keyframed on every frame, including lens changes from autofocus |
 | **Your models** | At the position you placed them. USDZ files come across; boxes and spheres are rebuilt in Blender |
 | **Room** | The LiDAR scan or detected floors, set up to catch shadows |
-| **Lighting** | The room's average brightness and colour, plus a sun you can move |
+| **Lighting** | A 32-bit HDRI (`room_hdri.exr`) from your light scan, aligned with the camera track and matched to the video's exposure. Without a scan: the room's average brightness and colour, plus a sun you can move |
 | **Compositor** | Lays the render and its shadows over your video |
 | **Render settings** | Cycles, 128 samples, matching the video's resolution and frame rate. Frames save to a `render` folder beside the `.blend` |
 
@@ -86,7 +89,7 @@ blender --background --python pc/trackshot_blender.py -- build capture.zip out.b
 
 - **Landscape only.** Filming in one fixed orientation keeps the video and camera data aligned.
 - **USDZ models only in the app.** To use another format, export it from Blender as USDZ first. You can also skip models in the app and add them in Blender afterwards.
-- **No HDRI capture yet.** The lighting is only an average, so the sun's direction is a starting guess. For matched lighting, add your own HDRI to the World in Blender.
+- **The HDRI comes from processed photos, not raw sensor data.** The iPhone tone-maps its images, so brightness is close rather than exact. Direct sun or very bright bulbs may still clip at the darkest exposure, which makes them dimmer than in reality. Stay in one spot while scanning, because the scan treats the room as being far away.
 - **No audio** is recorded.
 - **Models can't move during a take.** The `.blend` file stores one position for each.
 
@@ -104,4 +107,10 @@ blender --background --factory-startup --python trackshot_blender.py -- build te
 
 ```bash
 blender --background --factory-startup test_out/built.blend --python tests/check_blend.py -- test_out/manifest.json test_out
+```
+
+This one simulates a light scan of a room with known brightness, and compares the HDRI and a render with the true values:
+
+```bash
+blender --background --factory-startup --python tests/check_light_scan.py -- test_out
 ```

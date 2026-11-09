@@ -42,12 +42,21 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
     @Published private(set) var lastCapture: URL?
     @Published var selectedModel = PlaceableModel.box
     @Published var errorMessage: String?
+    @Published private(set) var isScanningLight = false
+    @Published private(set) var scanCoverage = [Bool](
+        repeating: false,
+        count: LightScanner.gridColumns * LightScanner.gridRows
+    )
+    @Published private(set) var scanPhotoCount = 0
+    @Published private(set) var hasLightScan = false
 
     private var placed: [PlacedObject] = []
+    private var completedScan: CompletedLightScan?
 
     // Frames arrive here. `recorder` is only touched on this queue.
     private nonisolated let recordQueue = DispatchQueue(label: "trackshot.recording")
     private nonisolated(unsafe) var recorder: TakeRecorder?
+    private nonisolated(unsafe) var scanner: LightScanner?
 
     override init() {
         super.init()
@@ -150,19 +159,70 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
+    // MARK: Light scan
+
+    func toggleLightScan() {
+        if isScanningLight {
+            finishLightScan()
+        } else if !isRecording && !isSaving {
+            startLightScan()
+        }
+    }
+
+    private func startLightScan() {
+        do {
+            let folder = try CaptureExporter.newFolder(prefix: "LightScan_")
+            if let old = completedScan {
+                try? FileManager.default.removeItem(at: old.folder)
+            }
+            completedScan = nil
+            hasLightScan = false
+            scanCoverage = scanCoverage.map { _ in false }
+            scanPhotoCount = 0
+            isScanningLight = true
+            let device = ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera
+            recordQueue.async {
+                let scan = LightScanner(folder: folder, device: device)
+                scan.begin()
+                self.scanner = scan
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func finishLightScan() {
+        isScanningLight = false
+        recordQueue.async {
+            guard let scan = self.scanner else { return }
+            self.scanner = nil
+            scan.end()
+            let result = CompletedLightScan(folder: scan.folder, frames: scan.frames)
+            Task { @MainActor in
+                if result.frames.count >= LightScanner.minimumFrames {
+                    self.completedScan = result
+                    self.hasLightScan = true
+                } else {
+                    try? FileManager.default.removeItem(at: result.folder)
+                    self.errorMessage = "The light scan was too short. Turn slowly and look all around the room."
+                }
+            }
+        }
+    }
+
     // MARK: Recording
 
     func toggleRecording() {
         if isRecording {
             stopRecording()
-        } else if !isSaving {
+        } else if !isSaving && !isScanningLight {
             startRecording()
         }
     }
 
     private func startRecording() {
         do {
-            let take = TakeRecorder(folder: try CaptureExporter.newTakeFolder(), fps: fps)
+            let take = TakeRecorder(folder: try CaptureExporter.newFolder(prefix: "Take_"), fps: fps)
             recordQueue.async { self.recorder = take }
             // Objects stay put during a take: the .blend stores one position for each.
             placed.forEach { $0.gestures.forEach { $0.isEnabled = false } }
@@ -180,6 +240,7 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
         placed.forEach { $0.gestures.forEach { $0.isEnabled = true } }
 
         let anchors = arView.session.currentFrame?.anchors ?? []
+        let lightScan = completedScan
         let snapshots = placed.enumerated().map { index, object in
             snapshot(of: object, index: index)
         }
@@ -199,7 +260,8 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
                             frames: frames,
                             light: light,
                             objects: snapshots,
-                            anchors: anchors
+                            anchors: anchors,
+                            lightScan: lightScan
                         )
                     }
                     Task { @MainActor in self.finishSaving(exported) }
@@ -235,6 +297,14 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
     // MARK: ARSessionDelegate (called on recordQueue)
 
     nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        if let scan = scanner, scan.process(frame) {
+            let covered = scan.covered
+            let count = scan.frames.count
+            Task { @MainActor in
+                self.scanCoverage = covered
+                self.scanPhotoCount = count
+            }
+        }
         guard let take = recorder else { return }
         do {
             try take.append(frame)
@@ -267,6 +337,7 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
         // Tracking is lost during an interruption, so end the take while it's good.
         Task { @MainActor in
             if self.isRecording { self.stopRecording() }
+            if self.isScanningLight { self.finishLightScan() }
         }
     }
 

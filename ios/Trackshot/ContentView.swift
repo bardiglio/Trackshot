@@ -72,6 +72,14 @@ struct ContentView: View {
             }
             .disabled(controller.placedCount == 0)
             Button {
+                controller.toggleLightScan()
+            } label: {
+                Label(
+                    controller.hasLightScan ? "Rescan light" : "Scan light",
+                    systemImage: controller.hasLightScan ? "checkmark.circle.fill" : "sun.max"
+                )
+            }
+            Button {
                 showSettings = true
             } label: {
                 Label("PC", systemImage: "desktopcomputer")
@@ -79,8 +87,50 @@ struct ContentView: View {
         }
         .buttonStyle(.bordered)
         .tint(.white)
-        .opacity(controller.isRecording ? 0.3 : 1)
-        .disabled(controller.isRecording || controller.isSaving)
+        .opacity(controller.isRecording || controller.isScanningLight ? 0.3 : 1)
+        .disabled(controller.isRecording || controller.isSaving || controller.isScanningLight)
+    }
+
+    // MARK: Light scan
+
+    private var lightScanPanel: some View {
+        VStack(spacing: 8) {
+            Text("Stay in one spot and turn slowly. Look up, down and all around until the map fills in.")
+                .font(.footnote.weight(.medium))
+                .multilineTextAlignment(.center)
+                .foregroundStyle(.white)
+            Canvas { context, size in
+                let columns = LightScanner.gridColumns
+                let rows = LightScanner.gridRows
+                let cellWidth = size.width / CGFloat(columns)
+                let cellHeight = size.height / CGFloat(rows)
+                for row in 0..<rows {
+                    for column in 0..<columns where controller.scanCoverage[row * columns + column] {
+                        let cell = CGRect(
+                            x: CGFloat(column) * cellWidth,
+                            y: CGFloat(row) * cellHeight,
+                            width: cellWidth,
+                            height: cellHeight
+                        )
+                        context.fill(Path(cell), with: .color(.yellow))
+                    }
+                }
+            }
+            .frame(width: 216, height: 108)
+            .background(.white.opacity(0.15))
+            .accessibilityLabel("Map of the directions scanned so far")
+            Text(String(
+                format: "%.0f%% of the room · %d photos",
+                LightScanner.coverageFraction(controller.scanCoverage) * 100,
+                controller.scanPhotoCount
+            ))
+            .font(.caption2)
+            .foregroundStyle(.white)
+            Button("Finish scan") { controller.toggleLightScan() }
+                .buttonStyle(.borderedProminent)
+        }
+        .padding(12)
+        .background(.black.opacity(0.6), in: RoundedRectangle(cornerRadius: 12))
     }
 
     // MARK: Middle
@@ -89,6 +139,11 @@ struct ContentView: View {
         VStack(spacing: 8) {
             if let message = controller.trackingMessage {
                 banner(message)
+            }
+            if controller.isScanningLight {
+                lightScanPanel
+            } else if controller.trackingMessage != nil {
+                EmptyView()
             } else if controller.isRecording {
                 banner(String(format: "%.1f s", Double(controller.recordedFrames) / Double(max(controller.fps, 1))))
             } else if controller.isSaving {
@@ -182,7 +237,7 @@ struct ContentView: View {
                 }
             }
             .accessibilityLabel(controller.isRecording ? "Stop recording" : "Start recording")
-            .disabled(controller.isSaving)
+            .disabled(controller.isSaving || controller.isScanningLight)
             Text(controller.videoFormatLabel)
                 .font(.caption2)
                 .foregroundStyle(.white)

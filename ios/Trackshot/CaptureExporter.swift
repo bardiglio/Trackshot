@@ -15,11 +15,11 @@ enum CaptureExporter {
         return documents.appendingPathComponent("Captures", isDirectory: true)
     }
 
-    static func newTakeFolder() throws -> URL {
+    static func newFolder(prefix: String) throws -> URL {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("Take_" + formatter.string(from: Date()), isDirectory: true)
+            .appendingPathComponent(prefix + formatter.string(from: Date()), isDirectory: true)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         return folder
     }
@@ -31,7 +31,8 @@ enum CaptureExporter {
         frames: [FrameInfo],
         light: LightInfo,
         objects: [PlacedSnapshot],
-        anchors: [ARAnchor]
+        anchors: [ARAnchor],
+        lightScan: CompletedLightScan?
     ) throws -> URL {
         let manager = FileManager.default
         defer { try? manager.removeItem(at: folder) }
@@ -42,6 +43,16 @@ enum CaptureExporter {
                 if !manager.fileExists(atPath: target.path) {
                     try manager.copyItem(at: source, to: target)
                 }
+            }
+        }
+
+        // Copied rather than moved, because later takes reuse the same scan.
+        for frame in lightScan?.frames ?? [] {
+            if let scanFolder = lightScan?.folder {
+                try manager.copyItem(
+                    at: scanFolder.appendingPathComponent(frame.file),
+                    to: folder.appendingPathComponent(frame.file)
+                )
             }
         }
 
@@ -59,7 +70,8 @@ enum CaptureExporter {
             // A LiDAR room scan already includes the floor.
             planes: meshes.isEmpty ? horizontalPlanes(in: anchors) : [],
             roomMesh: roomMesh,
-            light: light
+            light: light,
+            lightScan: lightScan?.frames
         )
         let data = try JSONEncoder().encode(manifest)
         try data.write(to: folder.appendingPathComponent("manifest.json"))

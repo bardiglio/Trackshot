@@ -11,6 +11,7 @@ struct Manifest: Encodable {
     var planes: [PlaneInfo]
     var roomMesh: String?
     var light: LightInfo
+    var lightScan: [ScanFrameInfo]?
 }
 
 struct VideoInfo: Encodable {
@@ -58,6 +59,20 @@ struct PlaneInfo: Encodable {
 struct LightInfo: Encodable {
     var ambientIntensity: Double
     var colorTemperature: Double
+    /// The take's typical exposure time multiplied by ISO. Blender uses it to match
+    /// the HDRI's brightness to the video.
+    var exposure: Double?
+}
+
+/// One photo from the light scan. Its intrinsics are scaled to the photo's size.
+struct ScanFrameInfo: Encodable {
+    var file: String
+    var width: Int
+    var height: Int
+    var camera: [[Float]]
+    var intrinsics: Intrinsics
+    var exposureTime: Double
+    var iso: Double
 }
 
 extension simd_float4x4 {

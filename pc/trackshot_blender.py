@@ -37,11 +37,14 @@ import zipfile
 
 import addon_utils
 import bpy
+import numpy as np
 from bpy_extras.io_utils import ImportHelper
 from mathutils import Matrix, Quaternion, Vector
 
 SUPPORTED_FORMAT = 1
 MAX_UPLOAD_BYTES = 50 * 1024**3
+HDRI_WIDTH = 2048
+MIN_SCAN_FRAMES = 6
 
 # ARKit's world is Y-up and Blender's is Z-up.
 Y_UP_TO_Z_UP = Matrix.Rotation(math.radians(90.0), 4, "X")
@@ -288,12 +291,203 @@ def kelvin_to_rgb(kelvin):
     return tuple(max(0.0, min(255.0, value)) / 255.0 for value in (red, green, blue))
 
 
-def build_lighting(scene, manifest):
-    """Match the room's average brightness and colour, and add a movable sun.
+def srgb_to_linear(values):
+    return np.where(
+        values <= 0.04045, values / 12.92, ((values + 0.055) / 1.055) ** 2.4
+    ).astype(np.float32)
+
+
+def read_scan_image(path):
+    """Load a scan photo as sRGB-encoded floats, with the top row first."""
+    image = bpy.data.images.load(path)
+    try:
+        width, height = image.size
+        if width == 0 or height == 0:
+            raise CaptureError(f"Couldn't read scan photo {os.path.basename(path)}")
+        pixels = np.empty(width * height * 4, dtype=np.float32)
+        image.pixels.foreach_get(pixels)
+    finally:
+        bpy.data.images.remove(image)
+    return pixels.reshape(height, width, 4)[::-1, :, :3]
+
+
+def equirect_directions(width, height):
+    """World direction of each panorama pixel, in Blender's and ARKit's axes.
+
+    Follows the mapping Blender's Environment Texture node uses.
+    """
+    u = (np.arange(width, dtype=np.float32) + 0.5) / width
+    v = 1.0 - (np.arange(height, dtype=np.float32) + 0.5) / height
+    azimuth = (0.5 - u) * 2.0 * np.pi
+    elevation = (v - 0.5) * np.pi
+    x = np.cos(elevation)[:, None] * np.cos(azimuth)[None, :]
+    y = np.cos(elevation)[:, None] * np.sin(azimuth)[None, :]
+    z = np.broadcast_to(np.sin(elevation)[:, None], x.shape)
+    # Inverse of to_blender_point: ARKit (x, y, z) is Blender (x, -z, y).
+    return np.stack((x, z, -y), axis=-1).astype(np.float32)
+
+
+def add_scan_frame(frame, root, directions, totals, weights, clipped):
+    """Accumulate one scan photo's radiance into the panorama buffers."""
+    encoded = read_scan_image(safe_member(root, frame["file"]))
+    linear = srgb_to_linear(encoded)
+    height, width = encoded.shape[:2]
+
+    intrinsics = frame["intrinsics"]
+    rotation = np.array(frame["camera"], dtype=np.float32)[:3, :3]
+    local = directions @ rotation  # Same as applying the inverse rotation.
+    in_front = local[..., 2] < -1e-3
+    rows, columns = np.nonzero(in_front)
+    local = local[rows, columns]
+    depth = -local[:, 2]
+    px = intrinsics["fx"] * local[:, 0] / depth + intrinsics["cx"]
+    py = intrinsics["cy"] - intrinsics["fy"] * local[:, 1] / depth
+    # Image coordinates here run through pixel centres.
+    px -= 0.5
+    py -= 0.5
+    inside = (px >= 0) & (px < width - 1) & (py >= 0) & (py < height - 1)
+    rows, columns, px, py = rows[inside], columns[inside], px[inside], py[inside]
+    if rows.size == 0:
+        return
+
+    left, top = px.astype(np.int32), py.astype(np.int32)
+    fx, fy = (px - left)[:, None], (py - top)[:, None]
+    sampled = (
+        linear[top, left] * (1 - fx) * (1 - fy)
+        + linear[top, left + 1] * fx * (1 - fy)
+        + linear[top + 1, left] * (1 - fx) * fy
+        + linear[top + 1, left + 1] * fx * fy
+    )
+    brightest = encoded[top + np.rint(fy[:, 0]).astype(np.int32),
+                        left + np.rint(fx[:, 0]).astype(np.int32)].max(axis=1)
+
+    # Radiance is independent of exposure, which is what makes the brackets merge.
+    radiance = sampled / float(frame["exposureTime"] * frame["iso"])
+
+    trust_highlights = np.clip((0.95 - brightest) / 0.10, 0.0, 1.0)
+    trust_shadows = np.clip(brightest / 0.10, 0.02, 1.0)
+    edge = np.minimum.reduce((px, width - 1 - px, py, height - 1 - py))
+    trust_edges = np.clip(edge / (0.1 * width), 0.05, 1.0)
+    weight = trust_highlights * trust_shadows * trust_edges
+
+    np.add.at(totals, (rows, columns), radiance * weight[:, None])
+    np.add.at(weights, (rows, columns), weight)
+    # A light still clipped at the darkest exposure is at least this bright.
+    saturated = trust_highlights == 0.0
+    clipped[rows[saturated], columns[saturated]] = np.maximum(
+        clipped[rows[saturated], columns[saturated]], radiance[saturated]
+    )
+
+
+def fill_holes(image, known):
+    """Fill unscanned directions from their surroundings, coarsest detail first."""
+    levels = [(image * known[..., None], known.astype(np.float32))]
+    while min(levels[-1][1].shape) > 2:
+        colour, weight = levels[-1]
+        height, width = weight.shape
+        colour = colour[: height // 2 * 2, : width // 2 * 2]
+        weight = weight[: height // 2 * 2, : width // 2 * 2]
+        levels.append((
+            colour.reshape(height // 2, 2, width // 2, 2, 3).sum(axis=(1, 3)),
+            weight.reshape(height // 2, 2, width // 2, 2).sum(axis=(1, 3)),
+        ))
+
+    colour, weight = levels[-1]
+    filled = colour.sum(axis=(0, 1)) / max(weight.sum(), 1e-6)
+    filled = np.broadcast_to(filled, colour.shape).astype(np.float32)
+    for colour, weight in reversed(levels[:-1]):
+        height, width = weight.shape
+        upsampled = np.repeat(np.repeat(filled, 2, axis=0), 2, axis=1)
+        upsampled = np.pad(
+            upsampled,
+            ((0, height - upsampled.shape[0]), (0, width - upsampled.shape[1]), (0, 0)),
+            mode="edge",
+        )
+        # Rolling wraps left to right, as the panorama does.
+        smooth = sum(np.roll(upsampled, shift, axis=1) for shift in (-1, 0, 1)) / 3.0
+        smooth[1:-1] = (smooth[:-2] + smooth[1:-1] + smooth[2:]) / 3.0
+        known_here = weight > 1e-6
+        safe_weight = np.where(known_here, weight, 1.0)[..., None]
+        filled = np.where(known_here[..., None], colour / safe_weight, smooth).astype(np.float32)
+    return filled
+
+
+def stitch_hdri(frames, root, width=HDRI_WIDTH):
+    """Merge the bracketed scan photos into one radiance panorama."""
+    height = width // 2
+    directions = equirect_directions(width, height)
+    totals = np.zeros((height, width, 3), dtype=np.float32)
+    weights = np.zeros((height, width), dtype=np.float32)
+    clipped = np.zeros((height, width, 3), dtype=np.float32)
+    for frame in frames:
+        add_scan_frame(frame, root, directions, totals, weights, clipped)
+
+    measured = weights > 1e-4
+    known = measured | (clipped.max(axis=2) > 0)
+    image = np.where(
+        measured[..., None], totals / np.maximum(weights, 1e-4)[..., None], clipped
+    )
+    return fill_holes(image, known), float(known.mean())
+
+
+def save_hdri(pixels, path):
+    height, width = pixels.shape[:2]
+    image = bpy.data.images.new(
+        "Room HDRI", width, height, alpha=False, float_buffer=True
+    )
+    # This has to happen before saving: Blender encodes the file in this space.
+    for name in ("Linear Rec.709", "Linear"):
+        try:
+            image.colorspace_settings.name = name
+            break
+        except TypeError:
+            continue
+    rgba = np.ones((height, width, 4), dtype=np.float32)
+    rgba[..., :3] = pixels
+    image.pixels.foreach_set(rgba[::-1].ravel())
+    image.filepath_raw = path
+    image.file_format = "OPEN_EXR"
+    image.save()
+    return image
+
+
+def build_hdri_world(scene, manifest, root):
+    """Light the scene from the phone's light scan, matched to the video's exposure."""
+    frames = manifest["lightScan"]
+    pixels, coverage = stitch_hdri(frames, root)
+
+    # The video recorded radiance times this exposure. Multiplying by it makes a
+    # surface lit by this HDRI come out as bright as the same surface in the video.
+    light = manifest.get("light") or {}
+    exposure = light.get("exposure") or float(
+        np.median([frame["exposureTime"] * frame["iso"] for frame in frames])
+    )
+    image = save_hdri(pixels * float(exposure), os.path.join(root, "room_hdri.exr"))
+
+    world = bpy.data.worlds.new("Room HDRI")
+    if world.node_tree is None:  # New worlds already have nodes from Blender 5.0
+        world.use_nodes = True
+    nodes = world.node_tree.nodes
+    background = next(n for n in nodes if n.type == "BACKGROUND")
+    background.inputs["Strength"].default_value = 1.0
+    texture = nodes.new("ShaderNodeTexEnvironment")
+    texture.image = image
+    texture.location = (background.location.x - 320, background.location.y)
+    world.node_tree.links.new(texture.outputs["Color"], background.inputs["Color"])
+    scene.world = world
+    print(f"Light scan covered {coverage:.0%} of the room", flush=True)
+
+
+def build_lighting(scene, manifest, root):
+    """Use the phone's light scan if there is one, otherwise a simple estimate.
 
     ARKit's estimate has no direction, so the sun's angle is only a starting
-    point. Drop in your own HDRI for matched lighting.
+    point when there's no scan.
     """
+    if len(manifest.get("lightScan") or []) >= MIN_SCAN_FRAMES:
+        build_hdri_world(scene, manifest, root)
+        return
+
     light = manifest.get("light") or {}
     strength = float(light.get("ambientIntensity", 1000.0)) / 1000.0
     color = kelvin_to_rgb(float(light.get("colorTemperature", 6500.0)))
@@ -365,7 +559,7 @@ def build_scene(root):
     build_camera(scene, manifest, clip)
     build_objects(scene, manifest, root)
     build_environment(scene, manifest, root)
-    build_lighting(scene, manifest)
+    build_lighting(scene, manifest, root)
     build_compositor(scene, clip)
     return manifest
 

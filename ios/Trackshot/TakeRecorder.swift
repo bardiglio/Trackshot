@@ -33,6 +33,7 @@ final class TakeRecorder {
     private var intensitySum = 0.0
     private var temperatureSum = 0.0
     private var lightSamples = 0
+    private var exposureSamples: [Double] = []
 
     var frameCount: Int { frames.count }
 
@@ -66,6 +67,9 @@ final class TakeRecorder {
             temperatureSum += Double(estimate.ambientColorTemperature)
             lightSamples += 1
         }
+        if frames.count % 15 == 1, let exposure = FrameExposure.read(from: frame) {
+            exposureSamples.append(exposure.time * exposure.iso)
+        }
     }
 
     /// Closes the video and hands back everything except the scene contents.
@@ -78,11 +82,14 @@ final class TakeRecorder {
         input.markAsFinished()
         let video = VideoInfo(file: Self.videoFileName, width: width, height: height, fps: fps)
         let samples = max(lightSamples, 1)
+        let sortedExposures = exposureSamples.sorted()
+        let medianExposure = sortedExposures.isEmpty ? nil : sortedExposures[sortedExposures.count / 2]
         let light = lightSamples == 0
-            ? LightInfo(ambientIntensity: 1000, colorTemperature: 6500)
+            ? LightInfo(ambientIntensity: 1000, colorTemperature: 6500, exposure: medianExposure)
             : LightInfo(
                 ambientIntensity: intensitySum / Double(samples),
-                colorTemperature: temperatureSum / Double(samples)
+                colorTemperature: temperatureSum / Double(samples),
+                exposure: medianExposure
             )
         let frames = self.frames
         writer.finishWriting {
