@@ -1,0 +1,12 @@
+# Generated on the build machine by xcodegen and xcodebuild
+ios/Trackshot.xcodeproj/
+ios/Trackshot/Info.plist
+ios/build/
+ios/Payload/
+*.ipa
+
+# Python and Blender
+__pycache__/
+*.blend
+*.blend1
+test_out/

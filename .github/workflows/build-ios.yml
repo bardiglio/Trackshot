@@ -1,0 +1,52 @@
+# Compiles the iPhone app on a GitHub-hosted Mac, so no Mac of your own is needed.
+# The result is an unsigned .ipa, which a sideloading tool signs when installing it.
+name: Build iPhone app
+
+on:
+  push:
+    paths:
+      - "ios/**"
+      - ".github/workflows/build-ios.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate the Xcode project
+        working-directory: ios
+        run: |
+          brew install xcodegen
+          xcodegen generate
+
+      - name: Compile for iPhone, without signing
+        working-directory: ios
+        run: |
+          xcodebuild build \
+            -project Trackshot.xcodeproj \
+            -target Trackshot \
+            -configuration Release \
+            -sdk iphoneos \
+            SYMROOT="$PWD/build" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO
+
+      - name: Package as an .ipa
+        working-directory: ios
+        run: |
+          mkdir Payload
+          cp -R build/Release-iphoneos/Trackshot.app Payload/
+          zip -qry Trackshot.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Trackshot-ipa
+          path: ios/Trackshot.ipa
+          if-no-files-found: error
+          retention-days: 30

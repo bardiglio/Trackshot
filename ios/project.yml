@@ -1,0 +1,33 @@
+name: Trackshot
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "17.0"
+targets:
+  Trackshot:
+    type: application
+    platform: iOS
+    sources: [Trackshot]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.trackshot
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1"
+        CODE_SIGN_STYLE: Automatic
+    info:
+      path: Trackshot/Info.plist
+      properties:
+        CFBundleDisplayName: Trackshot
+        UILaunchScreen: {}
+        UIRequiresFullScreen: true
+        # Locked to the sensor's native orientation, so the video and camera data
+        # never need rotating. Portrait isn't supported.
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationLandscapeRight]
+        UIRequiredDeviceCapabilities: [arkit]
+        NSCameraUsageDescription: Trackshot films through the camera and tracks its movement.
+        NSLocalNetworkUsageDescription: Trackshot sends your captures to your PC over Wi-Fi.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
+        # Makes captures visible in the iPhone Files app.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
