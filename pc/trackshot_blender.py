@@ -459,8 +459,10 @@ def build_hdri_world(scene, manifest, root):
     # The video recorded radiance times this exposure. Multiplying by it makes a
     # surface lit by this HDRI come out as bright as the same surface in the video.
     light = manifest.get("light") or {}
+    # Without the take's exposure, the scan's brightest bracket is the closest
+    # thing to it: that bracket uses the camera's normal exposure.
     exposure = light.get("exposure") or float(
-        np.median([frame["exposureTime"] * frame["iso"] for frame in frames])
+        np.max([frame["exposureTime"] * frame["iso"] for frame in frames])
     )
     image = save_hdri(pixels * float(exposure), os.path.join(root, "room_hdri.exr"))
 

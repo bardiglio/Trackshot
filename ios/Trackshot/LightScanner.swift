@@ -135,7 +135,13 @@ final class LightScanner {
 
     private func savePhotoIfNeeded(_ frame: ARFrame, stopIndex: Int) -> Bool {
         guard frames.count < Self.maximumFrames else { return false }
-        guard case .normal = frame.camera.trackingState else { return false }
+        // The dark brackets can make ARKit report too little detail for a moment.
+        // Its pose is still good then, and rejecting those frames would lose
+        // exactly the photos that record the bright lights.
+        switch frame.camera.trackingState {
+        case .normal, .limited(.insufficientFeatures): break
+        default: return false
+        }
 
         let axis = frame.camera.transform.columns.2
         let forward = -simd_normalize(SIMD3(axis.x, axis.y, axis.z))
