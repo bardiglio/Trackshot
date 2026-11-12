@@ -12,6 +12,8 @@ struct Manifest: Encodable {
     var roomMesh: String?
     var light: LightInfo
     var lightScan: [ScanFrameInfo]?
+    /// The white balance the light scan was locked to, as red, green and blue gains.
+    var lightScanWhiteBalance: [Float]?
 }
 
 struct VideoInfo: Encodable {
@@ -62,6 +64,9 @@ struct LightInfo: Encodable {
     /// The take's typical exposure time multiplied by ISO. Blender uses it to match
     /// the HDRI's brightness to the video.
     var exposure: Double?
+    /// The take's typical white balance, as red, green and blue gains. Blender uses
+    /// it to give the HDRI the same colour cast as the video.
+    var whiteBalanceGains: [Float]?
 }
 
 /// One photo from the light scan. Its intrinsics are scaled to the photo's size.
@@ -73,6 +78,8 @@ struct ScanFrameInfo: Encodable {
     var intrinsics: Intrinsics
     var exposureTime: Double
     var iso: Double
+    /// The picture's average brightness from 0 to 255, kept for troubleshooting.
+    var level: Float
 }
 
 extension simd_float4x4 {

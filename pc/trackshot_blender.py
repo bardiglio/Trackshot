@@ -45,6 +45,7 @@ SUPPORTED_FORMAT = 1
 MAX_UPLOAD_BYTES = 50 * 1024**3
 HDRI_WIDTH = 2048
 MIN_SCAN_FRAMES = 6
+MIN_CALIBRATION_SAMPLES = 100
 
 # ARKit's world is Y-up and Blender's is Z-up.
 Y_UP_TO_Z_UP = Matrix.Rotation(math.radians(90.0), 4, "X")
@@ -327,8 +328,13 @@ def equirect_directions(width, height):
     return np.stack((x, z, -y), axis=-1).astype(np.float32)
 
 
-def add_scan_frame(frame, root, directions, totals, weights, clipped):
-    """Accumulate one scan photo's radiance into the panorama buffers."""
+def sample_scan_frame(frame, root, directions):
+    """Look up one scan photo's pixels for the panorama directions it covers.
+
+    Returns the panorama rows and columns, the photo's linear colour and brightest
+    encoded channel at each, and how far to trust each for being away from the
+    photo's edge. Returns None if the photo covers nothing.
+    """
     encoded = read_scan_image(safe_member(root, frame["file"]))
     linear = srgb_to_linear(encoded)
     height, width = encoded.shape[:2]
@@ -348,7 +354,7 @@ def add_scan_frame(frame, root, directions, totals, weights, clipped):
     inside = (px >= 0) & (px < width - 1) & (py >= 0) & (py < height - 1)
     rows, columns, px, py = rows[inside], columns[inside], px[inside], py[inside]
     if rows.size == 0:
-        return
+        return None
 
     left, top = px.astype(np.int32), py.astype(np.int32)
     fx, fy = (px - left)[:, None], (py - top)[:, None]
@@ -361,13 +367,103 @@ def add_scan_frame(frame, root, directions, totals, weights, clipped):
     brightest = encoded[top + np.rint(fy[:, 0]).astype(np.int32),
                         left + np.rint(fx[:, 0]).astype(np.int32)].max(axis=1)
 
+    edge = np.minimum.reduce((px, width - 1 - px, py, height - 1 - py))
+    trust_edges = np.clip(edge / (0.1 * width), 0.05, 1.0)
+    return rows, columns, sampled, brightest, trust_edges
+
+
+def measure_exposures(frames, root, width=512):
+    """Work out each scan photo's real exposure from the photos themselves.
+
+    A real iPhone's dark brackets come out far brighter than the exposure the
+    camera reports for them. So only the brightest bracket's reported exposure
+    is trusted. Every other photo is measured against what the brighter photos
+    recorded in the same directions.
+    """
+    reported = np.array(
+        [frame["exposureTime"] * frame["iso"] for frame in frames], dtype=np.float64
+    )
+    height = width // 2
+    directions = equirect_directions(width, height)
+    samples = []
+    for frame in frames:
+        sample = sample_scan_frame(frame, root, directions)
+        if sample is None:
+            samples.append(None)
+            continue
+        rows, columns, colour, brightest, _ = sample
+        usable = (brightest > 0.05) & (brightest < 0.9)
+        samples.append(
+            (rows[usable], columns[usable], colour[usable].mean(axis=1).astype(np.float64))
+        )
+
+    exposures = reported.copy()
+    total = np.zeros((height, width))
+    count = np.zeros((height, width))
+
+    def add(index):
+        rows, columns, level = samples[index]
+        np.add.at(total, (rows, columns), level / exposures[index])
+        np.add.at(count, (rows, columns), 1.0)
+
+    def measure(index, leave_out=False):
+        rows, columns, level = samples[index]
+        seen = count[rows, columns]
+        known = total[rows, columns]
+        if leave_out:
+            seen = seen - 1.0
+            known = known - level / exposures[index]
+        valid = (seen > 0.5) & (known > 1e-12) & (level > 0)
+        if valid.sum() < MIN_CALIBRATION_SAMPLES:
+            return None
+        return float(np.median(level[valid] * seen[valid] / known[valid]))
+
+    stops = np.round(np.log2(reported / reported.max())).astype(int)
+    correction = 1.0
+    for position, bracket in enumerate(sorted(set(stops.tolist()), reverse=True)):
+        members = [i for i in np.nonzero(stops == bracket)[0] if samples[i] is not None]
+        if position == 0:
+            # The brightest bracket: check its photos against each other, keeping
+            # their typical exposure as reported.
+            for index in members:
+                add(index)
+            measured = {index: measure(index, leave_out=True) for index in members}
+            good = [index for index in members if measured[index]]
+            if good:
+                scale = np.median(reported[good]) / np.median([measured[i] for i in good])
+                for index in good:
+                    exposures[index] = measured[index] * scale
+                total[:] = 0.0
+                count[:] = 0.0
+                for index in members:
+                    add(index)
+            continue
+
+        measured = {index: measure(index) for index in members}
+        ratios = [measured[i] / reported[i] for i in members if measured[i]]
+        if ratios:
+            correction = float(np.median(ratios))
+        for index in members:
+            exposures[index] = measured[index] or reported[index] * correction
+        for index in members:
+            add(index)
+        if members:
+            actual = np.median(np.log2(exposures[members] / reported.max()))
+            print(
+                f"Light scan bracket reported at {bracket} stops measures {actual:.1f} stops",
+                flush=True,
+            )
+    return exposures
+
+
+def add_scan_frame(sample, exposure, totals, weights, clipped):
+    """Accumulate one scan photo's radiance into the panorama buffers."""
+    rows, columns, sampled, brightest, trust_edges = sample
     # Radiance is independent of exposure, which is what makes the brackets merge.
-    radiance = sampled / float(frame["exposureTime"] * frame["iso"])
+    radiance = sampled / float(exposure)
 
     trust_highlights = np.clip((0.95 - brightest) / 0.10, 0.0, 1.0)
     trust_shadows = np.clip(brightest / 0.10, 0.02, 1.0)
-    edge = np.minimum.reduce((px, width - 1 - px, py, height - 1 - py))
-    trust_edges = np.clip(edge / (0.1 * width), 0.05, 1.0)
     weight = trust_highlights * trust_shadows * trust_edges
 
     np.add.at(totals, (rows, columns), radiance * weight[:, None])
@@ -419,8 +515,11 @@ def stitch_hdri(frames, root, width=HDRI_WIDTH):
     totals = np.zeros((height, width, 3), dtype=np.float32)
     weights = np.zeros((height, width), dtype=np.float32)
     clipped = np.zeros((height, width, 3), dtype=np.float32)
-    for frame in frames:
-        add_scan_frame(frame, root, directions, totals, weights, clipped)
+    exposures = measure_exposures(frames, root)
+    for frame, exposure in zip(frames, exposures):
+        sample = sample_scan_frame(frame, root, directions)
+        if sample is not None:
+            add_scan_frame(sample, exposure, totals, weights, clipped)
 
     measured = weights > 1e-4
     known = measured | (clipped.max(axis=2) > 0)
@@ -435,20 +534,33 @@ def save_hdri(pixels, path):
     image = bpy.data.images.new(
         "Room HDRI", width, height, alpha=False, float_buffer=True
     )
-    # This has to happen before saving: Blender encodes the file in this space.
-    for name in ("Linear Rec.709", "Linear"):
-        try:
-            image.colorspace_settings.name = name
-            break
-        except TypeError:
-            continue
+    # Saving as non-colour data writes the values exactly as they are. Otherwise
+    # Blender encodes them for display, and other programs read the file wrongly.
+    image.colorspace_settings.name = "Non-Color"
     rgba = np.ones((height, width, 4), dtype=np.float32)
     rgba[..., :3] = pixels
     image.pixels.foreach_set(rgba[::-1].ravel())
     image.filepath_raw = path
     image.file_format = "OPEN_EXR"
     image.save()
+    for name in ("Linear Rec.709", "Linear"):
+        try:
+            image.colorspace_settings.name = name
+            break
+        except TypeError:
+            continue
     return image
+
+
+def white_balance_correction(manifest):
+    """Factors that give the scan's colours the same white balance as the video."""
+    scan = manifest.get("lightScanWhiteBalance")
+    take = (manifest.get("light") or {}).get("whiteBalanceGains")
+    if not scan or not take or len(scan) != 3 or len(take) != 3 or min(*scan, *take) <= 0:
+        return np.ones(3, dtype=np.float32)
+    ratio = np.array(take, dtype=np.float64) / np.array(scan, dtype=np.float64)
+    # Brightness is matched through the exposure, so keep green unchanged.
+    return (ratio / ratio[1]).astype(np.float32)
 
 
 def build_hdri_world(scene, manifest, root):
@@ -464,7 +576,8 @@ def build_hdri_world(scene, manifest, root):
     exposure = light.get("exposure") or float(
         np.max([frame["exposureTime"] * frame["iso"] for frame in frames])
     )
-    image = save_hdri(pixels * float(exposure), os.path.join(root, "room_hdri.exr"))
+    pixels = pixels * float(exposure) * white_balance_correction(manifest)
+    image = save_hdri(pixels, os.path.join(root, "room_hdri.exr"))
 
     world = bpy.data.worlds.new("Room HDRI")
     if world.node_tree is None:  # New worlds already have nodes from Blender 5.0
@@ -501,11 +614,11 @@ def build_lighting(scene, manifest, root):
     background.inputs["Color"].default_value = (*color, 1.0)
     # Split so ambient plus sun keeps a mid-grey object below clipping, and the
     # sun is strong enough to cast a visible shadow.
-    background.inputs["Strength"].default_value = 0.4 * strength
+    background.inputs["Strength"].default_value = 0.3 * strength
     scene.world = world
 
     sun_data = bpy.data.lights.new("Key Sun (adjust me)", "SUN")
-    sun_data.energy = 1.5 * strength
+    sun_data.energy = 1.0 * strength
     sun_data.color = color
     sun_data.angle = math.radians(5.0)
     sun = bpy.data.objects.new("Key Sun (adjust me)", sun_data)

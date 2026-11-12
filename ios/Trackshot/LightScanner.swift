@@ -7,6 +7,7 @@ import ImageIO
 struct CompletedLightScan {
     var folder: URL
     var frames: [ScanFrameInfo]
+    var whiteBalanceGains: [Float]?
 }
 
 /// The exposure a frame was actually captured with, as reported by the camera.
@@ -35,8 +36,10 @@ final class LightScanner {
 
     private static let exposureStops: [Float] = [0, -4, -8]
     private static let stopSequence = [0, 1, 0, 2]
-    /// Long enough for a new exposure to reach the frames ARKit delivers.
-    private static let framesPerStep = 8
+    /// A new exposure reaches the picture late and gradually, so each bracket
+    /// waits for the picture's brightness to move and settle, within these limits.
+    private static let minimumFramesPerStep = 6
+    private static let maximumFramesPerStep = 30
     private static let maximumFrames = 300
     private static let photoWidth: CGFloat = 1280
     private static let minimumSeparation = cos(Float(20).degreesToRadians)
@@ -54,6 +57,12 @@ final class LightScanner {
     private var baseISO: Float = 0
     private var framesInStep = 0
     private var step = 0
+    private var previousLevel: Float = 0
+    private var levelAtStepStart: Float = 0
+    private var steadyFrames = 0
+    private var expectsChange = false
+    /// The white balance the scan was locked to, as red, green and blue gains.
+    private(set) var whiteBalanceGains: [Float]?
 
     init(folder: URL, device: AVCaptureDevice?) {
         self.folder = folder
@@ -97,6 +106,8 @@ final class LightScanner {
             defer { device.unlockForConfiguration() }
             // Without this, colours would shift between photos of the same wall.
             if device.isWhiteBalanceModeSupported(.locked) {
+                let gains = device.deviceWhiteBalanceGains
+                whiteBalanceGains = [gains.redGain, gains.greenGain, gains.blueGain]
                 device.whiteBalanceMode = .locked
             }
             applyStops(Self.exposureStops[0], to: device)
@@ -124,16 +135,49 @@ final class LightScanner {
 
     /// Returns true when the frame added a photo to the scan.
     func process(_ frame: ARFrame) -> Bool {
+        let level = Self.meanLevel(of: frame.capturedImage)
+        defer { previousLevel = level }
         framesInStep += 1
-        guard framesInStep >= Self.framesPerStep else { return false }
+        let isSteady = abs(level - previousLevel) <= 0.03 * max(level, previousLevel, 1)
+        steadyFrames = isSteady ? steadyFrames + 1 : 0
+        let hasMoved = !expectsChange
+            || abs(level - levelAtStepStart) > 0.15 * max(levelAtStepStart, 1)
+        let hasSettled = framesInStep >= Self.minimumFramesPerStep && steadyFrames >= 3 && hasMoved
+        guard hasSettled || framesInStep >= Self.maximumFramesPerStep else { return false }
+
         framesInStep = 0
+        steadyFrames = 0
         let stopIndex = Self.stopSequence[step]
         step = (step + 1) % Self.stopSequence.count
-        defer { moveToNextExposure() }
-        return savePhotoIfNeeded(frame, stopIndex: stopIndex)
+        defer {
+            moveToNextExposure()
+            levelAtStepStart = level
+            expectsChange = true
+        }
+        return savePhotoIfNeeded(frame, stopIndex: stopIndex, level: level)
     }
 
-    private func savePhotoIfNeeded(_ frame: ARFrame, stopIndex: Int) -> Bool {
+    /// The picture's average brightness from 0 to 255, from a sparse sample.
+    private static func meanLevel(of buffer: CVPixelBuffer) -> Float {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(buffer, 0) else { return 0 }
+        let width = CVPixelBufferGetWidthOfPlane(buffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(buffer, 0)
+        let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(buffer, 0)
+        let pixels = base.assumingMemoryBound(to: UInt8.self)
+        var sum = 0
+        var count = 0
+        for y in stride(from: 0, to: height, by: 16) {
+            for x in stride(from: 0, to: width, by: 16) {
+                sum += Int(pixels[y * rowBytes + x])
+                count += 1
+            }
+        }
+        return count > 0 ? Float(sum) / Float(count) : 0
+    }
+
+    private func savePhotoIfNeeded(_ frame: ARFrame, stopIndex: Int, level: Float) -> Bool {
         guard frames.count < Self.maximumFrames else { return false }
         // The dark brackets can make ARKit report too little detail for a moment.
         // Its pose is still good then, and rejecting those frames would lose
@@ -160,7 +204,8 @@ final class LightScanner {
             camera: frame.camera.transform.rows,
             intrinsics: photo.intrinsics,
             exposureTime: exposure.time,
-            iso: exposure.iso
+            iso: exposure.iso,
+            level: level
         ))
         savedDirections[stopIndex].append(forward)
         if stopIndex == 0 {
@@ -218,16 +263,18 @@ final class LightScanner {
         }
     }
 
-    /// Darkens by lowering ISO first, which is cleaner, then shortening the shutter.
+    /// Darkens by shortening the shutter first, then lowering ISO. On a real
+    /// iPhone, lowering ISO alone left the picture as bright as before.
     private func applyStops(_ stops: Float, to device: AVCaptureDevice) {
         guard device.isExposureModeSupported(.custom), baseDuration > 0, baseISO > 0 else { return }
         let format = device.activeFormat
-        let factor = pow(2, stops)
-        let iso = max(format.minISO, min(format.maxISO, baseISO * factor))
-        let wanted = baseDuration * Double(baseISO * factor / iso)
         let shortest = format.minExposureDuration.seconds
         let longest = format.maxExposureDuration.seconds
+        let wanted = baseDuration * Double(pow(2, stops))
         let duration = max(shortest, min(longest, wanted))
+        // Whatever the shutter couldn't cover is left to ISO.
+        let remaining = Float(wanted / duration)
+        let iso = max(format.minISO, min(format.maxISO, baseISO * remaining))
         device.setExposureModeCustom(
             duration: CMTime(seconds: duration, preferredTimescale: 1_000_000),
             iso: iso,

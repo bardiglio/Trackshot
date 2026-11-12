@@ -34,12 +34,15 @@ final class TakeRecorder {
     private var temperatureSum = 0.0
     private var lightSamples = 0
     private var exposureSamples: [Double] = []
+    private var gainSamples: [[Float]] = []
+    private let device: AVCaptureDevice?
 
     var frameCount: Int { frames.count }
 
-    init(folder: URL, fps: Int) {
+    init(folder: URL, fps: Int, device: AVCaptureDevice?) {
         self.folder = folder
         self.fps = fps
+        self.device = device
     }
 
     func append(_ frame: ARFrame) throws {
@@ -70,6 +73,9 @@ final class TakeRecorder {
         if frames.count % 15 == 1, let exposure = FrameExposure.read(from: frame) {
             exposureSamples.append(exposure.time * exposure.iso)
         }
+        if frames.count % 15 == 1, let gains = device?.deviceWhiteBalanceGains {
+            gainSamples.append([gains.redGain, gains.greenGain, gains.blueGain])
+        }
     }
 
     /// Closes the video and hands back everything except the scene contents.
@@ -84,12 +90,22 @@ final class TakeRecorder {
         let samples = max(lightSamples, 1)
         let sortedExposures = exposureSamples.sorted()
         let medianExposure = sortedExposures.isEmpty ? nil : sortedExposures[sortedExposures.count / 2]
+        let medianGains: [Float]? = gainSamples.isEmpty ? nil : (0..<3).map { channel in
+            let values = gainSamples.map { $0[channel] }.sorted()
+            return values[values.count / 2]
+        }
         let light = lightSamples == 0
-            ? LightInfo(ambientIntensity: 1000, colorTemperature: 6500, exposure: medianExposure)
+            ? LightInfo(
+                ambientIntensity: 1000,
+                colorTemperature: 6500,
+                exposure: medianExposure,
+                whiteBalanceGains: medianGains
+            )
             : LightInfo(
                 ambientIntensity: intensitySum / Double(samples),
                 colorTemperature: temperatureSum / Double(samples),
-                exposure: medianExposure
+                exposure: medianExposure,
+                whiteBalanceGains: medianGains
             )
         let frames = self.frames
         writer.finishWriting {

@@ -71,7 +71,8 @@ enum CaptureExporter {
             planes: meshes.isEmpty ? horizontalPlanes(in: anchors) : [],
             roomMesh: roomMesh,
             light: light,
-            lightScan: lightScan?.frames
+            lightScan: lightScan?.frames,
+            lightScanWhiteBalance: lightScan?.whiteBalanceGains
         )
         let data = try JSONEncoder().encode(manifest)
         try data.write(to: folder.appendingPathComponent("manifest.json"))

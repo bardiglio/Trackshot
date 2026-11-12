@@ -197,7 +197,11 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
             guard let scan = self.scanner else { return }
             self.scanner = nil
             scan.end()
-            let result = CompletedLightScan(folder: scan.folder, frames: scan.frames)
+            let result = CompletedLightScan(
+                folder: scan.folder,
+                frames: scan.frames,
+                whiteBalanceGains: scan.whiteBalanceGains
+            )
             Task { @MainActor in
                 if result.frames.count >= LightScanner.minimumFrames {
                     self.completedScan = result
@@ -222,7 +226,11 @@ final class CaptureController: NSObject, ObservableObject, ARSessionDelegate {
 
     private func startRecording() {
         do {
-            let take = TakeRecorder(folder: try CaptureExporter.newFolder(prefix: "Take_"), fps: fps)
+            let take = TakeRecorder(
+                folder: try CaptureExporter.newFolder(prefix: "Take_"),
+                fps: fps,
+                device: ARWorldTrackingConfiguration.configurableCaptureDeviceForPrimaryCamera
+            )
             recordQueue.async { self.recorder = take }
             // Objects stay put during a take: the .blend stores one position for each.
             placed.forEach { $0.gestures.forEach { $0.isEnabled = false } }
